@@ -50,6 +50,7 @@ type AuthFn = unsafe extern "C" fn(
 );
 type UtimesFn = unsafe extern "C" fn(*mut Ctx, *const c_char, *mut libc::timeval) -> c_int;
 type OpendirFn = unsafe extern "C" fn(*mut Ctx, *const c_char) -> *mut SFile;
+type RenameFn = unsafe extern "C" fn(*mut Ctx, *const c_char, *mut Ctx, *const c_char) -> c_int;
 type ReaddirFn = unsafe extern "C" fn(*mut Ctx, *mut SFile) -> *mut Dirent;
 
 const SMBC_DIR: c_uint = 7;
@@ -86,6 +87,7 @@ extern "C" {
     fn smbc_getFunctionReaddir(c: *mut Ctx) -> ReaddirFn;
     fn smbc_getFunctionClosedir(c: *mut Ctx) -> CloseFn;
     fn smbc_getFunctionRmdir(c: *mut Ctx) -> UnlinkFn;
+    fn smbc_getFunctionRename(c: *mut Ctx) -> RenameFn;
 }
 
 /// A file on a share reached through a gvfs mount, addressed both ways.
@@ -135,6 +137,7 @@ pub struct Client {
     readdir: ReaddirFn,
     closedir: CloseFn,
     rmdir: UnlinkFn,
+    rename: RenameFn,
 }
 
 /// One entry of a share subtree, addressed both ways like `Remote`.
@@ -194,6 +197,7 @@ impl Client {
                 readdir: smbc_getFunctionReaddir(ctx),
                 closedir: smbc_getFunctionClosedir(ctx),
                 rmdir: smbc_getFunctionRmdir(ctx),
+                rename: smbc_getFunctionRename(ctx),
             }
         };
         // libsmbclient connects lazily; probe the share so bad credentials
@@ -235,6 +239,21 @@ impl Client {
         let c = cstr(uri)?;
         // SAFETY: c is NUL-terminated; ctx is live.
         check(unsafe { (self.unlink)(self.ctx, c.as_ptr()) })
+    }
+
+    /// Renames `from` to `to` on the same share, replacing a file at `to`.
+    pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        let (f, t) = (cstr(from)?, cstr(to)?);
+        // SAFETY: both NUL-terminated; both names live on this context.
+        let res = check(unsafe { (self.rename)(self.ctx, f.as_ptr(), self.ctx, t.as_ptr()) });
+        match res {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                self.unlink(to)?;
+                // SAFETY: as above.
+                check(unsafe { (self.rename)(self.ctx, f.as_ptr(), self.ctx, t.as_ptr()) })
+            }
+            other => other,
+        }
     }
 
     /// Removes the empty directory at `uri`.

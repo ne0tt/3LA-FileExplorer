@@ -700,6 +700,9 @@ struct Worker {
     failed: HashSet<PathBuf>,
     /// Folder modes to apply once the pool has finished writing into them.
     deferred_modes: Vec<(PathBuf, u32)>,
+    /// Names in each remote destination folder, listed once, so resolving a
+    /// target is a set lookup instead of a FUSE round trip per file.
+    listed: HashMap<PathBuf, HashSet<OsString>>,
 }
 
 const MAX_ERRORS: usize = 100;
@@ -756,6 +759,7 @@ impl Worker {
             pool: None,
             failed: HashSet::new(),
             deferred_modes: Vec::new(),
+            listed: HashMap::new(),
         }
     }
 
@@ -938,9 +942,39 @@ impl Worker {
         }
     }
 
+    /// Whether `target` exists, from one listing of its folder when that is
+    /// on a gvfs mount (a negative lookup there costs a server round trip).
+    fn target_exists(&mut self, target: &Path) -> bool {
+        let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+            return fs::symlink_metadata(target).is_ok();
+        };
+        if !smb::on_gvfs(dir) {
+            return fs::symlink_metadata(target).is_ok();
+        }
+        if !self.listed.contains_key(dir) {
+            let Ok(rd) = fs::read_dir(dir) else { return fs::symlink_metadata(target).is_ok() };
+            self.listed.insert(dir.to_path_buf(), rd.flatten().map(|d| d.file_name()).collect());
+        }
+        self.listed[dir].contains(name)
+    }
+
+    /// Records a name this job is about to create, for `target_exists`.
+    fn note_written(&mut self, target: &Path) {
+        if let (Some(dir), Some(name)) = (target.parent(), target.file_name()) {
+            if let Some(names) = self.listed.get_mut(dir) {
+                names.insert(name.to_os_string());
+            }
+        }
+    }
+
     /// Decide where `src` should be written when `target` may already exist.
     fn resolve(&mut self, src: &Path, target: PathBuf) -> Resolution {
+        if !self.target_exists(&target) {
+            self.note_written(&target);
+            return Resolution::Write(target);
+        }
         let Ok(tmeta) = fs::symlink_metadata(&target) else {
+            self.note_written(&target);
             return Resolution::Write(target);
         };
         let smeta = fs::symlink_metadata(src).ok();
@@ -955,7 +989,9 @@ impl Worker {
             }
             let dir = target.parent().unwrap_or(Path::new("/"));
             let name = target.file_name().unwrap_or_default().to_string_lossy();
-            return Resolution::Write(fsutil::unique_name(dir, &name, "copy"));
+            let p = fsutil::unique_name(dir, &name, "copy");
+            self.note_written(&p);
+            return Resolution::Write(p);
         }
         let src_dir = smeta.is_some_and(|m| m.is_dir());
         let choice = match self.sticky {
@@ -984,7 +1020,9 @@ impl Worker {
                 }
                 let dir = target.parent().unwrap_or(Path::new("/")).to_path_buf();
                 let name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                Resolution::Write(fsutil::unique_name(&dir, &name, ""))
+                let p = fsutil::unique_name(&dir, &name, "");
+                self.note_written(&p);
+                Resolution::Write(p)
             }
             _ => {
                 self.cancel.store(true, Ordering::SeqCst);
@@ -1028,6 +1066,9 @@ impl Worker {
     /// only once complete, so a failed or cancelled replace keeps the original.
     fn replace(&mut self, op: Op, src: &Path, target: PathBuf) -> Option<PathBuf> {
         let tmp = partial_path(&target);
+        if let Some(ok) = self.replace_pooled(op, src, &tmp, &target) {
+            return ok.then_some(target);
+        }
         let before = self.losses();
         let res = self.apply(op, src, &tmp);
         self.drain();
@@ -1063,6 +1104,37 @@ impl Worker {
                 None
             }
         }
+    }
+
+    /// Replace of a regular file onto a non-directory while the pool is
+    /// active: the pool thread swaps the finished copy into place itself, so
+    /// a run of replaced files keeps every connection busy instead of
+    /// draining the pool for each one. None leaves it to the synchronous path.
+    fn replace_pooled(&mut self, op: Op, src: &Path, tmp: &Path, target: &Path) -> Option<bool> {
+        if self.pool.is_none() || op == Op::Link {
+            return None;
+        }
+        let meta = fs::symlink_metadata(src).ok()?;
+        if !meta.is_file() || fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+            return None;
+        }
+        if op == Op::Move {
+            // Same filesystem: one atomic rename does the whole replace.
+            match fs::rename(src, target) {
+                Ok(()) => {
+                    self.done_items += 1;
+                    self.done_bytes += meta.len();
+                    return Some(true);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {}
+                Err(e) => {
+                    self.fail(src, e);
+                    return Some(false);
+                }
+            }
+        }
+        self.submit(src, tmp, meta, op == Op::Move, Some(target.to_path_buf()));
+        Some(true)
     }
 
     /// Creates a symlink; when the destination filesystem refuses symlinks the
@@ -1124,6 +1196,7 @@ impl Worker {
             self.merge_children(Op::Move, src, dst)?;
             self.drain();
             let _ = fs::remove_dir(src);
+            self.done_items += 1;
             return Ok(());
         }
         match fs::rename(src, dst) {
@@ -1141,7 +1214,7 @@ impl Worker {
                 let meta = fs::symlink_metadata(src)?;
                 if self.pool.is_some() && meta.is_file() {
                     // The pool removes the source once its copy is complete.
-                    self.submit(src, dst, meta, true);
+                    self.submit(src, dst, meta, true, None);
                     return Ok(());
                 }
                 let before = self.losses();
@@ -1180,7 +1253,7 @@ impl Worker {
             }
         } else if ft.is_file() {
             if self.pool.is_some() {
-                self.submit(src, dst, meta, false);
+                self.submit(src, dst, meta, false, None);
                 return Ok(());
             }
             let mut buf = std::mem::take(&mut self.buf);
@@ -1202,8 +1275,8 @@ impl Worker {
 
     /// Hands a regular file to the copy pool, waiting (and reporting) while
     /// its queue is full.
-    fn submit(&mut self, src: &Path, dst: &Path, meta: fs::Metadata, remove_src: bool) {
-        let mut task = Task { src: src.to_path_buf(), dst: dst.to_path_buf(), meta, remove_src };
+    fn submit(&mut self, src: &Path, dst: &Path, meta: fs::Metadata, remove_src: bool, swap_to: Option<PathBuf>) {
+        let mut task = Task { src: src.to_path_buf(), dst: dst.to_path_buf(), meta, remove_src, swap_to };
         loop {
             let pool = self.pool.as_mut().unwrap();
             match pool.tx.try_send(task) {
@@ -1784,7 +1857,7 @@ fn partial_path(target: &Path) -> PathBuf {
 
 /// Parallel copies into a remote destination, where per-file round trips
 /// rather than bandwidth set the pace.
-const POOL_THREADS: usize = 4;
+const POOL_THREADS: usize = 8;
 
 struct Task {
     src: PathBuf,
@@ -1792,6 +1865,8 @@ struct Task {
     meta: fs::Metadata,
     /// Move: delete the source once the copy is complete.
     remove_src: bool,
+    /// Replace: `dst` is a partial name, renamed to this once complete.
+    swap_to: Option<PathBuf>,
 }
 
 struct Pool {
@@ -1818,16 +1893,25 @@ impl Pool {
                 let mut clients: HashMap<String, Option<smb_io::Client>> = HashMap::new();
                 loop {
                     let Ok(t) = rx.lock().unwrap().recv() else { return };
+                    // Reported under the final name, so a failure prunes it from `created`.
+                    let reported = t.swap_to.clone().unwrap_or_else(|| t.dst.clone());
                     let res = if cancel.load(Ordering::SeqCst) {
                         Err(io::ErrorKind::Interrupted.into())
                     } else {
                         let mut progress = |n| {
                             bytes.fetch_add(n, Ordering::Relaxed);
                         };
-                        transfer_file(&t, &mut clients, &cancel, &mut buf, &mut progress)
-                            .and_then(|()| if t.remove_src { remove_source(&t.src, &clients) } else { Ok(()) })
+                        let copied = transfer_file(&t, &mut clients, &cancel, &mut buf, &mut progress);
+                        let swapped = copied.and_then(|()| match &t.swap_to {
+                            Some(target) => swap_into(&t.dst, target, &clients).map_err(|e| {
+                                let _ = remove_direct(&t.dst, &clients);
+                                e
+                            }),
+                            None => Ok(()),
+                        });
+                        swapped.and_then(|()| if t.remove_src { remove_direct(&t.src, &clients) } else { Ok(()) })
                     };
-                    let _ = done_tx.send((t.src, t.dst, res));
+                    let _ = done_tx.send((t.src, reported, res));
                 }
             });
         }
@@ -1872,14 +1956,27 @@ fn connect_logged(r: &smb_io::Remote) -> Option<smb_io::Client> {
     c
 }
 
-/// Removes a moved file's source, over SMB when a session to its share is open.
-fn remove_source(src: &Path, clients: &HashMap<String, Option<smb_io::Client>>) -> io::Result<()> {
-    if let Some(r) = smb_io::remote(src) {
+/// Removes a file, over SMB when a session to its share is open.
+fn remove_direct(p: &Path, clients: &HashMap<String, Option<smb_io::Client>>) -> io::Result<()> {
+    if let Some(r) = smb_io::remote(p) {
         if let Some(Some(c)) = clients.get(&r.key) {
             return c.unlink(&r.uri);
         }
     }
-    fs::remove_file(src)
+    fs::remove_file(p)
+}
+
+/// Renames the finished copy `tmp` over `target`, over SMB when both are on
+/// a share with an open session (the gvfs view can lag behind direct writes).
+fn swap_into(tmp: &Path, target: &Path, clients: &HashMap<String, Option<smb_io::Client>>) -> io::Result<()> {
+    if let (Some(a), Some(b)) = (smb_io::remote(tmp), smb_io::remote(target)) {
+        if let Some(Some(c)) = clients.get(&a.key) {
+            if a.key == b.key {
+                return c.rename(&a.uri, &b.uri);
+            }
+        }
+    }
+    fs::rename(tmp, target)
 }
 
 fn copy_file(
