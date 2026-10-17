@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Name=3LA File Explorer
+GenericName=File Manager
+Comment=Browse the file system (Thunar-style, matugen themed)
+Exec=@BIN@ %U
+TryExec=@BIN@
+Icon=system-file-manager
+Terminal=false
+StartupNotify=true
+StartupWMClass=3LA-FileExplorer
+Categories=System;Core;FileTools;FileManager;
+MimeType=inode/directory;
+Keywords=file;manager;explorer;browser;thunar;folder;
+Actions=new-window;home;trash;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=@BIN@
+
+[Desktop Action home]
+Name=Open Home
+Exec=@BIN@
+
+[Desktop Action trash]
+Name=Open Trash
+Exec=@BIN@ trash:///
