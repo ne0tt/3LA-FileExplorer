@@ -7,7 +7,7 @@ with **JetBrainsMono Nerd Font** glyphs, and the whole UI follows your
 
 ![3LA File Explorer](docs/screenshot.png)
 
-> **About the code:** roughly 70% of this project is hand-written. I used
+> **About the code:** roughly 60% of this project is hand-written. I used
 > Claude AI to enhance and tidy up some areas. To be fair, I couldn't figure
 > out the encryption feature myself, so I largely handed that part off to AI.
 
