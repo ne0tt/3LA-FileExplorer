@@ -198,6 +198,24 @@ ApplicationWindow {
         toast((cut ? "Cut " : "Copied ") + s.length + " item" + (s.length === 1 ? "" : "s"))
     }
 
+    // Hosts whose sign-in for direct SMB transfers was declined this run.
+    property var smbDeclined: ({})
+
+    // Copy or move, first asking for share credentials when a local <-> SMB
+    // transfer could go direct (several times faster than through gvfs).
+    function transfer(move, paths, target) {
+        const run = () => move ? FileOps.moveTo(paths, target) : FileOps.copy(paths, target)
+        const host = Sys.smbCredsNeeded(paths, target)
+        const dlg = host && !smbDeclined[host.toLowerCase()] ? win.dialog("NetworkAuthDialog") : null
+        if (!dlg) return run()
+        dlg.ask("smb://" + host, host, "", run, () => {
+            const d = Object.assign({}, smbDeclined)
+            d[host.toLowerCase()] = true
+            smbDeclined = d
+            run()
+        }, "Sign in to copy straight to the server, several times faster. Cancel to use the slower gvfs path.")
+    }
+
     function paste(target) {
         const paths = Sys.clipboardPaths()
         if (!paths.length) {
@@ -206,16 +224,32 @@ ApplicationWindow {
         }
         const cut = Sys.clipboardIsCut()
         if (cut) {
-            FileOps.moveTo(paths, target)
+            transfer(true, paths, target)
             Sys.setClipboard([], false)
         } else {
-            FileOps.copy(paths, target)
+            transfer(false, paths, target)
         }
     }
 
     function trashSelected() {
         const s = sel()
         if (!s.length || pane.isTrash || pane.model.isVirtual) return
+        if (s.some(p => Sys.onShare(p))) {
+            // Shares have no trash; the fallback would copy every byte through
+            // FUSE into the home trash. Delete in place instead, always confirmed.
+            confirmDlg.ask({
+                header: "DELETE FROM SHARE",
+                tag: "BURN AFTER READING",
+                title: s.length === 1 ? "Delete this item from the share?" : "Delete " + s.length + " items from the share?",
+                subject: s.length === 1 ? Sys.basename(s[0]) : "",
+                message: "Network shares have no Trash. This cannot be undone.",
+                acceptText: "Delete",
+                danger: true,
+                defaultAccept: false,
+                onAccept: () => FileOps.remove(s)
+            })
+            return
+        }
         const go = () => FileOps.trash(s)
         if (appPrefs.confirmTrash)
             confirmDlg.ask({
@@ -385,7 +419,7 @@ ApplicationWindow {
 
     function sendTo(target) {
         const s = sel()
-        if (s.length) FileOps.copy(s, target)
+        if (s.length) transfer(false, s, target)
     }
 
     function linkToDesktop() {
@@ -966,6 +1000,7 @@ ApplicationWindow {
                         onMessage: text => win.toast(text)
                         onAccessDenied: p => win.dialog("AccessDeniedDialog").show(p, true)
                         onPreviewRequested: p => win.dialog("PreviewDialog").show(win.pane, p)
+                        onTransferRequested: (move, paths, target) => win.transfer(move, paths, target)
                         onDecryptRequested: paths => win.decryptPaths(paths, true)
                         onLockedFolderOpened: p => win.decryptPaths([p], false)
                         onAuthRequired: (uri, host, message) => win.dialog("NetworkAuthDialog").ask(uri, host, message, () => navigate(uri))

@@ -6,6 +6,7 @@ mod config;
 mod fsutil;
 mod icons;
 mod smb;
+mod smb_io;
 mod trashdir;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};

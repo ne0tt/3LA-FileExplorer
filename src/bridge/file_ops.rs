@@ -165,16 +165,16 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use cxx_qt::{CxxQtThread, CxxQtType, Threading};
 use cxx_qt_lib::{QString, QStringList};
 
 use crate::crypt::{self, CryptError};
-use crate::{archive, fsutil};
+use crate::{archive, fsutil, smb, smb_io};
 use age::secrecy::SecretString;
 use qobject::Choice;
 
@@ -694,6 +694,12 @@ struct Worker {
     /// (items, bytes) per top-level source, from `scan`.
     totals: HashMap<PathBuf, (usize, u64)>,
     buf: Vec<u8>,
+    /// Set for copies into a remote destination.
+    pool: Option<Pool>,
+    /// Pool copies that failed, so they are not reported as created.
+    failed: HashSet<PathBuf>,
+    /// Folder modes to apply once the pool has finished writing into them.
+    deferred_modes: Vec<(PathBuf, u32)>,
 }
 
 const MAX_ERRORS: usize = 100;
@@ -747,6 +753,9 @@ impl Worker {
             rejected: Vec::new(),
             totals: HashMap::new(),
             buf: Vec::new(),
+            pool: None,
+            failed: HashSet::new(),
+            deferred_modes: Vec::new(),
         }
     }
 
@@ -875,6 +884,9 @@ impl Worker {
             self.total_items = job.sources.len();
         } else {
             self.scan(&job.sources, true);
+            if fsutil::is_remote_fs(&job.dest) || job.sources.iter().any(|s| smb_io::remote(s).is_some()) {
+                self.pool = Some(Pool::new(&self.cancel));
+            }
         }
         if let Some(first) = job.sources.first() {
             self.report(first, true);
@@ -916,6 +928,13 @@ impl Worker {
                 self.done_items += 1;
             }
             self.report(src, false);
+        }
+        self.drain();
+        if !self.failed.is_empty() {
+            let failed = std::mem::take(&mut self.failed);
+            self.created.retain(|p| !failed.contains(p));
+            self.fresh.retain(|p| !failed.contains(p));
+            self.moved.retain(|(_, p)| !failed.contains(p));
         }
     }
 
@@ -1011,6 +1030,7 @@ impl Worker {
         let tmp = partial_path(&target);
         let before = self.losses();
         let res = self.apply(op, src, &tmp);
+        self.drain();
         let complete = match op {
             // A move is done once the source is gone, whatever else happened.
             Op::Move => fs::symlink_metadata(src).is_err(),
@@ -1102,6 +1122,7 @@ impl Worker {
         {
             // Merge move: the source folder is only removed if everything left it.
             self.merge_children(Op::Move, src, dst)?;
+            self.drain();
             let _ = fs::remove_dir(src);
             return Ok(());
         }
@@ -1117,8 +1138,15 @@ impl Worker {
                 Ok(())
             }
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                let meta = fs::symlink_metadata(src)?;
+                if self.pool.is_some() && meta.is_file() {
+                    // The pool removes the source once its copy is complete.
+                    self.submit(src, dst, meta, true);
+                    return Ok(());
+                }
                 let before = self.losses();
                 self.copy_item(src, dst)?;
+                self.drain();
                 if self.cancelled() || self.losses() != before {
                     // Incomplete copy (errors or skipped items): keep the source.
                     return Ok(());
@@ -1143,9 +1171,26 @@ impl Worker {
                 fs::create_dir(dst)?;
             }
             self.merge_children(Op::Copy, src, dst)?;
-            fs::set_permissions(dst, fs::Permissions::from_mode(meta.mode()))?;
+            if self.pool.is_some() {
+                // Pool copies into this folder may still be running, and a
+                // read-only mode would make them fail: applied after drain.
+                self.deferred_modes.push((dst.to_path_buf(), meta.mode()));
+            } else {
+                best_effort(fs::set_permissions(dst, fs::Permissions::from_mode(meta.mode())))?;
+            }
         } else if ft.is_file() {
-            self.copy_file(src, dst, &meta)?;
+            if self.pool.is_some() {
+                self.submit(src, dst, meta, false);
+                return Ok(());
+            }
+            let mut buf = std::mem::take(&mut self.buf);
+            let cancel = self.cancel.clone();
+            let res = copy_file(src, dst, &meta, &cancel, &mut buf, &mut |n| {
+                self.done_bytes += n;
+                self.report(src, false);
+            });
+            self.buf = buf;
+            res?;
         } else {
             self.skipped += 1;
             self.error(format!("{}: special files are skipped", src.display()));
@@ -1155,76 +1200,67 @@ impl Worker {
         Ok(())
     }
 
-    fn copy_file(&mut self, src: &Path, dst: &Path, meta: &fs::Metadata) -> io::Result<()> {
-        let mut input = File::open(src)?;
-        // Created with the source mode so a private file is never briefly readable.
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(meta.mode() & 0o777)
-            .open(dst)?;
-        if let Err(e) = self.pump(&mut input, &mut output, src) {
-            drop(output);
-            let _ = fs::remove_file(dst);
-            return Err(e);
+    /// Hands a regular file to the copy pool, waiting (and reporting) while
+    /// its queue is full.
+    fn submit(&mut self, src: &Path, dst: &Path, meta: fs::Metadata, remove_src: bool) {
+        let mut task = Task { src: src.to_path_buf(), dst: dst.to_path_buf(), meta, remove_src };
+        loop {
+            let pool = self.pool.as_mut().unwrap();
+            match pool.tx.try_send(task) {
+                Ok(()) => {
+                    pool.pending += 1;
+                    pool.current = src.to_path_buf();
+                    return;
+                }
+                Err(mpsc::TrySendError::Full(t)) => {
+                    task = t;
+                    self.collect(Duration::from_millis(80));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return,
+            }
         }
-        output.set_permissions(fs::Permissions::from_mode(meta.mode()))?;
-        let times = FileTimes::new()
-            .set_accessed(meta.accessed().unwrap_or(UNIX_EPOCH))
-            .set_modified(meta.modified().unwrap_or(UNIX_EPOCH));
-        let _ = output.set_times(times);
-        Ok(())
     }
 
-    /// Copies file contents, in-kernel via copy_file_range (reflinks / server-side
-    /// copy where supported), falling back to a userspace buffer.
-    fn pump(&mut self, input: &mut File, output: &mut File, src: &Path) -> io::Result<()> {
-        let mut kernel = true;
-        loop {
-            if self.cancelled() {
-                return Err(io::ErrorKind::Interrupted.into());
+    /// Folds in finished pool copies, waiting up to `wait` for the first one.
+    fn collect(&mut self, wait: Duration) {
+        let Some(pool) = self.pool.as_mut() else { return };
+        self.done_bytes += pool.bytes.swap(0, Ordering::Relaxed);
+        let mut finished = Vec::new();
+        if let Ok(r) = pool.done.recv_timeout(wait) {
+            finished.push(r);
+            finished.extend(pool.done.try_iter());
+        }
+        pool.pending -= finished.len();
+        let current = pool.current.clone();
+        for (src, dst, res) in finished {
+            self.done_items += 1;
+            if let Err(e) = res {
+                self.failed.insert(dst);
+                self.fail(&src, e);
             }
-            let n = if kernel {
-                // SAFETY: both fds are open for the duration of the call; null
-                // offsets use and advance the file positions.
-                let r = unsafe {
-                    libc::copy_file_range(
-                        input.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        output.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        COPY_CHUNK,
-                        0,
-                    )
-                };
-                if r < 0 {
-                    let e = io::Error::last_os_error();
-                    match e.raw_os_error() {
-                        Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM) => {
-                            kernel = false;
-                            continue;
-                        }
-                        _ => return Err(e),
-                    }
-                }
-                r as usize
-            } else {
-                if self.buf.is_empty() {
-                    self.buf = vec![0u8; 1 << 20];
-                }
-                let n = input.read(&mut self.buf)?;
-                output.write_all(&self.buf[..n])?;
-                n
-            };
-            if n == 0 {
-                return Ok(());
-            }
-            self.done_bytes += n as u64;
-            self.report(src, false);
+        }
+        self.report(&current, false);
+    }
+
+    /// Waits for every queued pool copy to finish.
+    fn drain(&mut self) {
+        while self.pool.as_ref().is_some_and(|p| p.pending > 0) {
+            self.collect(Duration::from_millis(80));
+        }
+        if let Some(pool) = self.pool.as_ref() {
+            self.done_bytes += pool.bytes.swap(0, Ordering::Relaxed);
+        }
+        for (p, mode) in std::mem::take(&mut self.deferred_modes) {
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(mode));
         }
     }
 
     fn run_trash(&mut self, job: &Job) {
+        // gvfs mounts have no trash (see smb::on_gvfs): the only sane
+        // "trash" there is a delete, which the UI confirms as such.
+        if job.sources.iter().any(|s| smb::on_gvfs(s)) {
+            return self.run_delete(job);
+        }
         self.total_items = job.sources.len();
         for (i, src) in job.sources.iter().enumerate() {
             if self.cancelled() {
@@ -1240,8 +1276,56 @@ impl Worker {
     }
 
     fn run_delete(&mut self, job: &Job) {
-        self.scan(&job.sources, false);
+        // Share trees are listed and removed over SMB directly: one round
+        // trip per entry instead of a FUSE hop plus a round trip for every
+        // stat and unlink.
+        let mut clients: HashMap<String, Option<smb_io::Client>> = HashMap::new();
+        let mut direct: Vec<(String, Vec<smb_io::Node>)> = Vec::new();
+        let mut local = Vec::new();
         for src in &job.sources {
+            if self.cancelled() {
+                break;
+            }
+            let Some(r) = smb_io::remote(src) else {
+                local.push(src.clone());
+                continue;
+            };
+            let Some(c) = clients.entry(r.key.clone()).or_insert_with(|| connect_logged(&r)) else {
+                local.push(src.clone());
+                continue;
+            };
+            let dir = match fs::symlink_metadata(src) {
+                Ok(m) => m.is_dir(),
+                Err(e) => {
+                    self.fail(src, e);
+                    continue;
+                }
+            };
+            let root = smb_io::Node { uri: r.uri, path: src.clone(), dir };
+            let mut errors = Vec::new();
+            let nodes = c.list_tree(root, &self.cancel, &mut |p, e| errors.push((p.to_path_buf(), e)));
+            for (p, e) in errors {
+                self.fail(&p, e);
+            }
+            self.total_items += nodes.len();
+            direct.push((r.key, nodes));
+        }
+        self.scan(&local, false);
+        for (key, nodes) in direct {
+            let c = clients[&key].as_ref().unwrap();
+            for n in nodes {
+                if self.cancelled() {
+                    return;
+                }
+                let res = if n.dir { c.rmdir(&n.uri) } else { c.unlink(&n.uri) };
+                match res {
+                    Ok(()) => self.done_items += 1,
+                    Err(e) => self.fail(&n.path, e),
+                }
+                self.report(&n.path, false);
+            }
+        }
+        for src in &local {
             if self.cancelled() {
                 break;
             }
@@ -1696,6 +1780,195 @@ fn inside(dest: &Path, src: &Path) -> bool {
 fn partial_path(target: &Path) -> PathBuf {
     let name = target.file_name().unwrap_or_default().to_string_lossy();
     target.with_file_name(format!(".{name}.3la-partial-{}", std::process::id()))
+}
+
+/// Parallel copies into a remote destination, where per-file round trips
+/// rather than bandwidth set the pace.
+const POOL_THREADS: usize = 4;
+
+struct Task {
+    src: PathBuf,
+    dst: PathBuf,
+    meta: fs::Metadata,
+    /// Move: delete the source once the copy is complete.
+    remove_src: bool,
+}
+
+struct Pool {
+    tx: mpsc::SyncSender<Task>,
+    done: Receiver<(PathBuf, PathBuf, io::Result<()>)>,
+    /// Bytes copied by the pool since the worker last looked.
+    bytes: Arc<AtomicU64>,
+    pending: usize,
+    /// Latest file handed out, for the progress title.
+    current: PathBuf,
+}
+
+impl Pool {
+    fn new(cancel: &Arc<AtomicBool>) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Task>(POOL_THREADS * 2);
+        let (done_tx, done) = mpsc::channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let bytes = Arc::new(AtomicU64::new(0));
+        for _ in 0..POOL_THREADS {
+            let (rx, done_tx, bytes, cancel) = (rx.clone(), done_tx.clone(), bytes.clone(), cancel.clone());
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                // One SMB connection per share, or None once it was refused.
+                let mut clients: HashMap<String, Option<smb_io::Client>> = HashMap::new();
+                loop {
+                    let Ok(t) = rx.lock().unwrap().recv() else { return };
+                    let res = if cancel.load(Ordering::SeqCst) {
+                        Err(io::ErrorKind::Interrupted.into())
+                    } else {
+                        let mut progress = |n| {
+                            bytes.fetch_add(n, Ordering::Relaxed);
+                        };
+                        transfer_file(&t, &mut clients, &cancel, &mut buf, &mut progress)
+                            .and_then(|()| if t.remove_src { remove_source(&t.src, &clients) } else { Ok(()) })
+                    };
+                    let _ = done_tx.send((t.src, t.dst, res));
+                }
+            });
+        }
+        Self { tx, done, bytes, pending: 0, current: PathBuf::new() }
+    }
+}
+
+/// Copies one file, straight over SMB when exactly one side is on a gvfs
+/// smb-share mount and the share accepts the app's credentials.
+fn transfer_file(
+    t: &Task,
+    clients: &mut HashMap<String, Option<smb_io::Client>>,
+    cancel: &AtomicBool,
+    buf: &mut Vec<u8>,
+    progress: &mut dyn FnMut(u64),
+) -> io::Result<()> {
+    let direct = match (smb_io::remote(&t.src), smb_io::remote(&t.dst)) {
+        (None, Some(r)) => Some((r, true)),
+        (Some(r), None) => Some((r, false)),
+        _ => None,
+    };
+    if let Some((r, upload)) = direct {
+        let client = clients.entry(r.key.clone()).or_insert_with(|| connect_logged(&r));
+        if let Some(c) = client {
+            return if upload {
+                c.upload(&t.src, &r.uri, &t.meta, cancel, buf, progress)
+            } else {
+                c.download(&r.uri, &t.dst, &t.meta, cancel, buf, progress)
+            };
+        }
+    }
+    copy_file(&t.src, &t.dst, &t.meta, cancel, buf, progress)
+}
+
+/// Opens a direct SMB session for `r`, saying so on stderr when it falls
+/// back to gvfs (several times slower) for want of accepted credentials.
+fn connect_logged(r: &smb_io::Remote) -> Option<smb_io::Client> {
+    let c = smb_io::Client::connect(r);
+    if c.is_none() {
+        eprintln!("3la-fileexplorer: no direct SMB session for //{}/{} (no accepted credentials), using gvfs", r.host, r.share);
+    }
+    c
+}
+
+/// Removes a moved file's source, over SMB when a session to its share is open.
+fn remove_source(src: &Path, clients: &HashMap<String, Option<smb_io::Client>>) -> io::Result<()> {
+    if let Some(r) = smb_io::remote(src) {
+        if let Some(Some(c)) = clients.get(&r.key) {
+            return c.unlink(&r.uri);
+        }
+    }
+    fs::remove_file(src)
+}
+
+fn copy_file(
+    src: &Path,
+    dst: &Path,
+    meta: &fs::Metadata,
+    cancel: &AtomicBool,
+    buf: &mut Vec<u8>,
+    progress: &mut dyn FnMut(u64),
+) -> io::Result<()> {
+    let mut input = File::open(src)?;
+    // Created with the source mode so a private file is never briefly readable.
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(meta.mode() & 0o777)
+        .open(dst)?;
+    if let Err(e) = pump(&mut input, &mut output, cancel, buf, progress) {
+        drop(output);
+        let _ = fs::remove_file(dst);
+        return Err(e);
+    }
+    best_effort(output.set_permissions(fs::Permissions::from_mode(meta.mode())))?;
+    let times = FileTimes::new()
+        .set_accessed(meta.accessed().unwrap_or(UNIX_EPOCH))
+        .set_modified(meta.modified().unwrap_or(UNIX_EPOCH));
+    let _ = output.set_times(times);
+    Ok(())
+}
+
+/// Copies file contents, in-kernel via copy_file_range (reflinks / server-side
+/// copy where supported), falling back to a userspace buffer.
+fn pump(
+    input: &mut File,
+    output: &mut File,
+    cancel: &AtomicBool,
+    buf: &mut Vec<u8>,
+    progress: &mut dyn FnMut(u64),
+) -> io::Result<()> {
+    let mut kernel = true;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let n = if kernel {
+            // SAFETY: both fds are open for the duration of the call; null
+            // offsets use and advance the file positions.
+            let r = unsafe {
+                libc::copy_file_range(
+                    input.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    output.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    COPY_CHUNK,
+                    0,
+                )
+            };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                match e.raw_os_error() {
+                    Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM) => {
+                        kernel = false;
+                        continue;
+                    }
+                    _ => return Err(e),
+                }
+            }
+            r as usize
+        } else {
+            if buf.is_empty() {
+                *buf = vec![0u8; 1 << 20];
+            }
+            let n = input.read(buf)?;
+            output.write_all(&buf[..n])?;
+            n
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        progress(n as u64);
+    }
+}
+
+/// Metadata the destination filesystem can't store (gvfs FUSE, vfat) is not a copy failure.
+fn best_effort(r: io::Result<()>) -> io::Result<()> {
+    match r {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EPERM | libc::ENOSYS)) => Ok(()),
+        other => other,
+    }
 }
 
 fn remove_any(p: &Path) -> io::Result<()> {

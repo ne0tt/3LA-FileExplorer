@@ -66,6 +66,7 @@ FocusScope {
     signal accessDenied(string path)
     signal authRequired(string uri, string host, string message)
     signal previewRequested(string path)
+    signal transferRequested(bool move, var paths, string target)
     // Encrypted items: .age files opened, or a locked folder shown.
     signal decryptRequested(var paths)
     signal lockedFolderOpened(string path)
@@ -398,8 +399,7 @@ FocusScope {
         if (action === Qt.MoveAction && paths.every(p => Sys.parent(p) === target))
             return
         if (action === Qt.LinkAction) FileOps.link(paths, target)
-        else if (action === Qt.CopyAction) FileOps.copy(paths, target)
-        else FileOps.moveTo(paths, target)
+        else transferRequested(action === Qt.MoveAction, paths, target)
         drop.accept(action)
     }
 

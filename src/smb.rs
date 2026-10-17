@@ -68,7 +68,7 @@ fn misses() -> &'static Mutex<std::collections::HashSet<String>> {
     M.get_or_init(Default::default)
 }
 
-fn creds_for(host: &str) -> Option<Creds> {
+pub fn creds_for(host: &str) -> Option<Creds> {
     let key = host.to_lowercase();
     if let Some(c) = creds().lock().unwrap().get(&key).cloned() {
         return Some(c);
@@ -229,6 +229,13 @@ fn gvfs_dir() -> PathBuf {
     PathBuf::from(format!("/run/user/{}/gvfs", unsafe { libc::getuid() }))
 }
 
+/// Whether `path` lies inside any gvfs mount. Those have no trash: the
+/// freedesktop fallback would copy every byte through FUSE into the home
+/// trash, or fail outright.
+pub fn on_gvfs(path: &std::path::Path) -> bool {
+    path.starts_with(gvfs_dir())
+}
+
 fn gvfs_fields(name: &str) -> Option<HashMap<String, String>> {
     let rest = name.strip_prefix("smb-share:")?;
     Some(
@@ -260,6 +267,15 @@ pub fn uri_for_local(path: &str) -> Option<(String, String)> {
     let f = gvfs_fields(&first)?;
     let uri = format!("smb://{}/{}", f.get("server")?, f.get("share")?);
     Some((uri, base.join(first).to_string_lossy().into_owned()))
+}
+
+/// (host, share, path inside the share) for a path under a gvfs smb-share mount.
+pub fn gvfs_location(path: &std::path::Path) -> Option<(String, String, String)> {
+    let rel = path.strip_prefix(gvfs_dir()).ok()?;
+    let mut parts = rel.components();
+    let f = gvfs_fields(&parts.next()?.as_os_str().to_string_lossy())?;
+    let rest = parts.as_path().to_str()?.to_string();
+    Some((f.get("server")?.clone(), f.get("share")?.clone(), rest))
 }
 
 /// smb:// URIs from the bookmarks file.

@@ -196,7 +196,8 @@ use cxx_qt_lib::{
     QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QStringList, QVariant,
     QVector,
 };
-use notify::{RecursiveMode, Watcher};
+use notify::event::{AccessKind, AccessMode, ModifyKind};
+use notify::{EventKind, RecursiveMode, Watcher};
 
 use crate::fsutil::{self, Entry, SortKey, SortSpec, TrashInfo};
 use crate::smb;
@@ -466,8 +467,13 @@ impl qobject::FolderModel {
         let burst: Arc<Mutex<Option<(Instant, Instant)>>> = Arc::default();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
-            if matches!(ev.kind, notify::EventKind::Access(_)) {
-                return;
+            // Content writes stream in for as long as a file is being copied
+            // (and each reload competes with it on a network mount); the close
+            // that ends them is enough to pick up the new size.
+            match ev.kind {
+                EventKind::Access(AccessKind::Close(AccessMode::Write)) => {}
+                EventKind::Access(_) | EventKind::Modify(ModifyKind::Data(_)) => return,
+                _ => {}
             }
             let now = Instant::now();
             {

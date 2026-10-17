@@ -220,6 +220,18 @@ pub mod qobject {
         #[cxx_name = "smbHasShare"]
         fn smb_has_share(self: &Sys, uri: &QString) -> bool;
 
+        /// Whether `path` lies inside a gvfs mount (SMB, SFTP, ...). Those
+        /// have no trash: "moving to trash" would download the file through FUSE.
+        #[qinvokable]
+        #[cxx_name = "onShare"]
+        fn on_share(self: &Sys, path: &QString) -> bool;
+
+        /// Host of an SMB share among `paths`/`dest` the app holds no
+        /// credentials for ("" if none): direct transfers need them.
+        #[qinvokable]
+        #[cxx_name = "smbCredsNeeded"]
+        fn smb_creds_needed(self: &Sys, paths: &QStringList, dest: &QString) -> QString;
+
         /// file:// URL of settings.conf, for the QML Settings element.
         #[qinvokable]
         #[cxx_name = "settingsUrl"]
@@ -1094,6 +1106,22 @@ impl qobject::Sys {
 
     pub fn smb_has_share(&self, uri: &QString) -> bool {
         smb::parse(&uri.to_string()).is_some_and(|u| u.share.is_some())
+    }
+
+    pub fn on_share(&self, path: &QString) -> bool {
+        smb::on_gvfs(Path::new(&path.to_string()))
+    }
+
+    pub fn smb_creds_needed(&self, paths: &QStringList, dest: &QString) -> QString {
+        let host = |p: &str| smb::gvfs_location(Path::new(p)).map(|(h, _, _)| h);
+        let sources = paths.iter().map(|p| host(&p.to_string())).collect::<Vec<_>>();
+        // Only local <-> share transfers go direct; share to share stays on gvfs.
+        let hosts = match host(&dest.to_string()) {
+            Some(h) if sources.iter().any(Option::is_none) => vec![h],
+            Some(_) => Vec::new(),
+            None => sources.into_iter().flatten().collect(),
+        };
+        qs(hosts.into_iter().find(|h| smb::creds_for(h).is_none()).as_deref().unwrap_or(""))
     }
 
     pub fn settings_url(&self) -> QString {

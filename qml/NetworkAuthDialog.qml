@@ -12,12 +12,18 @@ SpxDialog {
     property string host: ""
     property string message: ""
     property var connectFn: null
+    /// Called if the dialog closes without connecting (optional).
+    property var cancelFn: null
+    /// Neutral explanation under the URI (optional).
+    property string hint: ""
 
-    function ask(uri, host, message, onConnect) {
+    function ask(uri, host, message, onConnect, onCancel, hint) {
         d.uri = uri
         d.host = host
         d.message = message
+        d.hint = hint || ""
         connectFn = onConnect
+        cancelFn = onCancel || null
         if (!user.text) user.text = Sys.basename(Sys.homePath)
         if (!domain.text) domain.text = "WORKGROUP"
         password.text = ""
@@ -29,6 +35,7 @@ SpxDialog {
     function connect() {
         Sys.setSmbCredentials(host, user.text, domain.text, password.text, anonymous.checked, remember.checked)
         password.text = ""
+        cancelFn = null
         close()
         if (connectFn) connectFn()
     }
@@ -38,9 +45,20 @@ SpxDialog {
     cardWidth: 460
     buttonRow: footer
     onOpened: (anonymous.checked ? user : password).forceActiveFocus()
+    onClosed: {
+        const f = cancelFn
+        cancelFn = null
+        if (f) f()
+    }
 
     SpxTitle { text: "Connect to " + d.host }
     SpxText { text: d.uri; color: Theme.textFaint; wrapMode: Text.WrapAnywhere }
+    SpxText {
+        visible: d.hint.length > 0
+        text: d.hint
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
+    }
     SpxText {
         visible: d.message.length > 0 && d.message.indexOf("Authentication required") !== 0
         text: d.message
